@@ -1,0 +1,75 @@
+
+
+--- Tuned LightGBM Model Performance on Test Set (Full Eval) ---
+
+   learning_rate num_leaves max_depth feature_fraction bagging_fraction
+11          0.05         31         4              0.8              0.7
+   bagging_freq min_data_in_leaf
+11            1               20
+
+Nrounds used (from CV):  102 
+亚型类别:  Basal-like, HER2-enriched, Luminal A, Luminal B 
+
+Confusion Matrix and Statistics
+
+               Reference
+Prediction      Basal-like HER2-enriched Luminal A Luminal B
+  Basal-like            16             1         1         4
+  HER2-enriched          1             6         1         0
+  Luminal A              2             1        30        11
+  Luminal B              0             4        13        11
+
+Overall Statistics
+                                          
+               Accuracy : 0.6176          
+                 95% CI : (0.5161, 0.7121)
+    No Information Rate : 0.4412          
+    P-Value [Acc > NIR] : 0.0002525       
+                                          
+                  Kappa : 0.4461          
+                                          
+ Mcnemar's Test P-Value : 0.2037111       
+
+Statistics by Class:
+
+                     Class: Basal-like Class: HER2-enriched
+Sensitivity                     0.8421              0.50000
+Specificity                     0.9277              0.97778
+Pos Pred Value                  0.7273              0.75000
+Neg Pred Value                  0.9625              0.93617
+Prevalence                      0.1863              0.11765
+Detection Rate                  0.1569              0.05882
+Detection Prevalence            0.2157              0.07843
+Balanced Accuracy               0.8849              0.73889
+                     Class: Luminal A Class: Luminal B
+Sensitivity                    0.6667           0.4231
+Specificity                    0.7544           0.7763
+Pos Pred Value                 0.6818           0.3929
+Neg Pred Value                 0.7414           0.7973
+Prevalence                     0.4412           0.2549
+Detection Rate                 0.2941           0.1078
+Detection Prevalence           0.4314           0.2745
+Balanced Accuracy              0.7105           0.5997
+
+--- Manually Calculated Metrics ---
+Precision by Class:
+   Basal-like HER2-enriched     Luminal A     Luminal B 
+    0.8421053     0.5000000     0.6666667     0.4230769 
+Recall by Class:
+   Basal-like HER2-enriched     Luminal A     Luminal B 
+    0.7272727     0.7500000     0.6818182     0.3928571 
+F1-Score by Class:
+   Basal-like HER2-enriched     Luminal A     Luminal B 
+    0.7804878     0.6000000     0.6741573     0.4074074 
+
+Macro-Averaged Precision:  0.6080 
+Macro-Averaged Recall:     0.6380 
+Macro-Averaged F1-Score:   0.6155 
+
+Weighted-Averaged Precision:  0.6246 
+Weighted-Averaged Recall:     0.6176 
+Weighted-Averaged F1-Score:   0.6180 
+
+--- Caret Overall Statistics ---
+Accuracy:  0.6176 
+Kappa:     0.4461 

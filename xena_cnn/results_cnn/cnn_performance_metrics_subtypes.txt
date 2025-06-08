@@ -1,0 +1,67 @@
+--- 最佳1D CNN模型性能评估 (测试集 - 癌症亚型多分类) ---
+
+最佳参数组合:
+      filters1 kernel_size1 pool_size1 filters2 kernel_size2 dense_units
+28159       32            3          2        0            3         256
+      dropout_cnn dropout_dense learning_rate batch_size epochs
+28159         0.2           0.5         1e-04         16    100
+
+模型结构摘要:
+
+训练参数详情 (最佳模型):
+  Filters L1:  32 , Kernel L1:  3 , Pool L1:  2 
+  Dense Units:  256 
+  Dropout CNN:  0.2 , Dropout Dense:  0.5 
+  Learning Rate:  1e-04 
+  Batch Size:  16 
+  Target Epochs:  100 
+  Actual Epochs (best model):  47 
+
+使用的特征数量 (序列长度):  150 
+亚型类别:  Basal-like, HER2-enriched, Luminal A, Luminal B, Normal-like 
+
+测试集损失:  1.4527 
+测试集准确率:  0.4135 
+
+测试集混淆矩阵及详细统计:
+Confusion Matrix and Statistics
+
+               Reference
+Prediction      Basal-like HER2-enriched Luminal A Luminal B Normal-like
+  Basal-like             9             2         7         5           0
+  HER2-enriched          1             0         2         3           0
+  Luminal A              6             4        26        10           2
+  Luminal B              3             6        10         8           0
+  Normal-like            0             0         0         0           0
+
+Overall Statistics
+                                          
+               Accuracy : 0.4135          
+                 95% CI : (0.3177, 0.5142)
+    No Information Rate : 0.4327          
+    P-Value [Acc > NIR] : 0.6883          
+                                          
+                  Kappa : 0.1479          
+                                          
+ Mcnemar's Test P-Value : NA              
+
+Statistics by Class:
+
+                     Class: Basal-like Class: HER2-enriched Class: Luminal A
+Sensitivity                    0.47368              0.00000           0.5778
+Specificity                    0.83529              0.93478           0.6271
+Pos Pred Value                 0.39130              0.00000           0.5417
+Neg Pred Value                 0.87654              0.87755           0.6607
+Prevalence                     0.18269              0.11538           0.4327
+Detection Rate                 0.08654              0.00000           0.2500
+Detection Prevalence           0.22115              0.05769           0.4615
+Balanced Accuracy              0.65449              0.46739           0.6024
+                     Class: Luminal B Class: Normal-like
+Sensitivity                   0.30769            0.00000
+Specificity                   0.75641            1.00000
+Pos Pred Value                0.29630                NaN
+Neg Pred Value                0.76623            0.98077
+Prevalence                    0.25000            0.01923
+Detection Rate                0.07692            0.00000
+Detection Prevalence          0.25962            0.00000
+Balanced Accuracy             0.53205            0.50000

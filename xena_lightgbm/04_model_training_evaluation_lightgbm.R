@@ -1,0 +1,563 @@
+# 04_model_training_evaluation.R
+# 功能:
+# 1. 加载由03脚本划分好的亚型数据集。
+# 2. 将数据转换为LightGBM所需的 lgb.Dataset 格式。
+# 3. 通过手动网格搜索和交叉验证 (lgb.cv) 寻找LightGBM的近似最优超参数和nrounds。
+# 4. 使用找到的最优参数和nrounds训练最终的LightGBM模型。
+# 5. 记录和绘制CV过程及最终模型训练过程中的性能指标（如mlogloss, merror）。
+# 6. 在测试集上全面评估最终模型的性能（混淆矩阵、准确率、F1等）。
+# 7. 提取、可视化并保存模型的特征重要性。
+# 8. 保存训练好的LightGBM模型和所有相关的评估结果与图表。
+
+# --- 加载必要的R包 ---
+
+suppressPackageStartupMessages(library(lightgbm))    # LightGBM核心包
+suppressPackageStartupMessages(library(dplyr))        # 数据操作
+suppressPackageStartupMessages(library(ggplot2))      # 绘图
+suppressPackageStartupMessages(library(Matrix))       # LightGBM可以高效处理稀疏矩阵 (可选)
+suppressPackageStartupMessages(library(MLmetrics))    # 用于手动计算F1, Precision, Recall等指标
+suppressPackageStartupMessages(library(caret))        # 主要用于 confusionMatrix 生成详细评估报告
+suppressPackageStartupMessages(library(reshape2))     # 用于 melt 函数，方便ggplot处理数据
+
+# --- 参数定义与文件路径 ---
+data_splits_dir <- "data_splits"
+# 确保这些文件名与03脚本的输出完全一致
+train_file <- file.path(data_splits_dir, "train_set_subtypes.rds") # 或 train_set_clinicalMatrix_subtypes.rds
+validation_file <- file.path(data_splits_dir, "validation_set_subtypes.rds") # 或 validation_set_clinicalMatrix_subtypes.rds
+test_file <- file.path(data_splits_dir, "test_set_subtypes.rds")   # 或 test_set_clinicalMatrix_subtypes.rds
+
+model_output_dir <- "model"
+lgb_model_output_file <- file.path(model_output_dir, "lightgbm_model_tuned_direct_subtypes.rds")
+
+results_output_dir <- "results"
+param_search_results_file_lgb <- file.path(results_output_dir, "lgb_param_search_results.csv")
+cv_metrics_plot_file_lgb <- file.path(results_output_dir, "lgb_best_cv_metrics_plot.png")
+train_metrics_plot_file_lgb <- file.path(results_output_dir, "lgb_final_train_metrics_plot.png")
+importance_plot_file_lgb <- file.path(results_output_dir, "lgb_tuned_direct_feat_imp.png")
+performance_metrics_file_lgb <- file.path(results_output_dir, "lgb_tuned_direct_perf_metrics.txt")
+# log_file_lgb <- file.path(results_output_dir, "lightgbm_manual_tuning_log.txt") # 日志文件 (可选)
+
+cat("--- 开始模型训练与评估 (使用LightGBM手动调优, 增强评估) ---\n")
+
+# --- 1. 创建输出目录 ---
+if (!dir.exists(model_output_dir)) dir.create(model_output_dir, recursive = TRUE)
+if (!dir.exists(results_output_dir)) dir.create(results_output_dir, recursive = TRUE)
+
+# --- (可选) 日志记录 ---
+# sink(log_file_lgb, append = TRUE, split = TRUE) # 同时输出到控制台和文件
+# cat("\n\n--- LightGBM Manual Tuning Run Started at:", format(Sys.time()), "---\n")
+
+# --- 2. 加载数据集与标签处理 ---
+cat("步骤1: 加载数据集并处理标签...\n")
+if (!all(file.exists(train_file, validation_file, test_file))) {
+  stop(paste0("错误: 一个或多个数据集文件未找到。请检查路径和文件名:\n",
+              "Train: ", train_file, "\nValidation: ", validation_file, "\nTest: ", test_file))
+}
+train_set_df <- readRDS(train_file)
+validation_set_df <- readRDS(validation_file)
+test_set_df <- readRDS(test_file)
+
+original_levels <- levels(train_set_df$label) # 获取原始亚型名称
+if (is.null(original_levels) || length(original_levels) < 2) {
+  stop("错误: 训练集标签不是有效的因子或类别少于2。")
+}
+
+# 创建标签到数值 (0-based) 和数值到原始因子标签的映射
+level_map_to_numeric <- setNames(0:(length(original_levels)-1), original_levels)
+numeric_map_to_original_factor <- setNames(factor(original_levels, levels=original_levels), 0:(length(original_levels)-1))
+
+# 转换标签为数值
+train_labels_numeric <- level_map_to_numeric[as.character(train_set_df$label)]
+validation_labels_numeric <- level_map_to_numeric[as.character(validation_set_df$label)]
+test_labels_numeric <- level_map_to_numeric[as.character(test_set_df$label)]
+
+num_classes <- length(original_levels) # 类别数量
+cat("类别数量: ", num_classes, "\n")
+cat("原始类别: ", paste(original_levels, collapse=", "), "\n")
+
+# 获取用于训练的特征数量 (假设02脚本已完成预过滤)
+num_features_from_02 <- ncol(train_set_df) - 1 # 减去'label'列
+cat("用于LightGBM训练的特征数量 (来自02/03脚本): ", num_features_from_02, "\n")
+if (num_features_from_02 <= 0) stop("错误: 没有特征可用于训练。请检查02和03脚本的输出。")
+if (num_features_from_02 > 3000) { # 再次提醒，如果特征仍然很多
+  cat("警告: 特征数量 (", num_features_from_02, ") 仍然较多，LightGBM训练可能较慢或内存消耗大。\n",
+      "考虑在02脚本中设置更小的 TARGET_NUM_FEATURES_PREFILTER。\n")
+}
+
+# --- 3. 准备LightGBM数据格式 (lgb.Dataset) ---
+cat("\n步骤2: 准备LightGBM数据格式 (lgb.Dataset)...\n")
+# 提取特征列名
+feature_column_names <- setdiff(names(train_set_df), "label")
+
+# 转换为数值矩阵
+train_features_matrix <- as.matrix(train_set_df[, feature_column_names])
+validation_features_matrix <- as.matrix(validation_set_df[, feature_column_names])
+test_features_matrix <- as.matrix(test_set_df[, feature_column_names])
+
+# 保存原始特征名，用于后续lgb.importance的正确显示
+original_feature_names_for_lgb_imp <- colnames(train_features_matrix)
+if (is.null(original_feature_names_for_lgb_imp)) { # 双重保险
+  original_feature_names_for_lgb_imp <- feature_column_names
+}
+cat("特征名已保存，数量: ", length(original_feature_names_for_lgb_imp), "\n")
+
+# 移除原始数据框以节省内存
+rm(train_set_df, validation_set_df, test_set_df); gc()
+cat("原始数据框已移除。\n")
+
+# 确保矩阵是数值型
+if(!is.numeric(train_features_matrix)) storage.mode(train_features_matrix) <- "numeric"
+if(!is.numeric(validation_features_matrix)) storage.mode(validation_features_matrix) <- "numeric"
+if(!is.numeric(test_features_matrix)) storage.mode(test_features_matrix) <- "numeric"
+
+# 创建 lgb.Dataset 对象
+# LightGBM会从输入矩阵的colnames获取特征名，所以不需要显式传递feature_name参数
+dtrain_lgb <- lgb.Dataset(data = train_features_matrix, label = train_labels_numeric)
+dvalidation_lgb <- lgb.Dataset(data = validation_features_matrix, label = validation_labels_numeric, reference = dtrain_lgb)
+dtest_lgb <- lgb.Dataset(data = test_features_matrix, label = test_labels_numeric, reference = dtrain_lgb)
+cat("lgb.Dataset对象创建完成。\n")
+
+
+# --- 4. 定义LightGBM超参数网格进行手动搜索 ---
+cat("\n步骤3: 定义LightGBM超参数网格...\n")
+# 【可调参数网格】根据计算资源和时间调整。这是一个较小的示例网格。
+param_grid_lgb <- expand.grid(
+  learning_rate = c(0.05, 0.1),       # 学习率
+  num_leaves = c(15, 31),             # 每棵树的叶子数
+  max_depth = c(4, 6),                # 最大深度 (可以设-1表示无限制，但通常先限制)
+  feature_fraction = c(0.7, 0.8),     # 列采样 (特征采样)
+  bagging_fraction = c(0.7, 0.8),     # 行采样 (数据采样)
+  bagging_freq = c(1),                # bagging的频率 (每k次迭代执行一次bagging)
+  min_data_in_leaf = c(20)            # 每个叶子节点最少样本数
+  # lambda_l1 = c(0, 0.1),            # L1 正则化 (可选)
+  # lambda_l2 = c(0, 0.1)             # L2 正则化 (可选)
+)
+cat("将对 ", nrow(param_grid_lgb), " 组LightGBM超参数组合进行评估。\n")
+
+# --- 5. 手动网格搜索与交叉验证 (LightGBM) ---
+cat("\n步骤4: 开始手动网格搜索与交叉验证 (LightGBM)...\n")
+set.seed(123) # 保证CV划分和某些随机过程的可复现性
+NROUNDS_CV_MAX_LGB <- 200       # CV时尝试的最大轮数 (迭代次数)
+EARLY_STOPPING_ROUNDS_CV_LGB <- 30 # 如果验证集指标在这么多轮内没有改善，则停止
+cv_fold_n_lgb <- 5              # K-fold CV的K值
+
+all_cv_results_lgb <- list()    # 用于存储每次CV的结果
+best_cv_metric_value_lgb <- Inf # 初始化为无穷大 (因为我们要最小化损失，如mlogloss)
+best_params_from_cv_lgb <- NULL   # 存储最优参数组合
+best_nrounds_from_cv_lgb <- NULL  # 存储最优参数组合对应的最佳轮数
+best_metric_name_from_cv <- ""  # 存储取得最优结果的指标名称
+
+for (i in 1:nrow(param_grid_lgb)) {
+  current_params_row <- param_grid_lgb[i, ]
+  cat("\n评估参数组合 ", i, "/", nrow(param_grid_lgb), ":\n"); print(current_params_row)
+  
+  lgb_cv_params_list <- list(
+    objective = "multiclass",         # 多分类任务
+    metric = "multi_logloss",       # 主要评估指标 (也可以是 "multi_error")
+    # 如果指定多个: metric = c("multi_logloss", "multi_error")
+    # lgb.cv的best_score会基于最后一个指定的metric
+    num_class = num_classes,          # 类别数量
+    learning_rate = current_params_row$learning_rate,
+    num_leaves = current_params_row$num_leaves,
+    max_depth = current_params_row$max_depth,
+    feature_fraction = current_params_row$feature_fraction,
+    bagging_fraction = current_params_row$bagging_fraction,
+    bagging_freq = current_params_row$bagging_freq,
+    min_data_in_leaf = current_params_row$min_data_in_leaf,
+    # lambda_l1 = current_params_row$lambda_l1, # 如果在网格中定义了
+    # lambda_l2 = current_params_row$lambda_l2, # 如果在网格中定义了
+    verbosity = -1,                   # 静默LightGBM本身的打印 (除错误和警告)
+    num_threads = 0                   # 0 表示使用所有可用核心 (通常是默认行为)
+  )
+  
+  lgb_cv_run <- NULL
+  tryCatch({
+    lgb_cv_run <- lgb.cv(
+      params = lgb_cv_params_list,
+      data = dtrain_lgb,             # 训练数据
+      nrounds = NROUNDS_CV_MAX_LGB,  # 最大迭代次数
+      nfold = cv_fold_n_lgb,         # K折交叉验证
+      stratified = TRUE,             # 对不平衡类别进行分层抽样
+      early_stopping_rounds = EARLY_STOPPING_ROUNDS_CV_LGB, # 早停轮数
+      verbose = -1,                  # lgb.cv本身的打印控制
+      eval_freq = 10                 # 每10轮在日志中记录一次指标
+      # record = TRUE                # lgb.cv默认记录评估结果
+    )
+  }, error = function(e) { 
+    cat("错误: lgb.cv对参数组合 ", i, " 失败: ", conditionMessage(e), "\n"); lgb_cv_run <<- NULL 
+  })
+  
+  if (!is.null(lgb_cv_run) && !is.null(lgb_cv_run$best_iter) && lgb_cv_run$best_iter > 0) {
+    current_best_iteration <- lgb_cv_run$best_iter
+    current_best_metric <- lgb_cv_run$best_score # 这是在best_iter时，验证集上，基于params$metric中最后一个指标的值
+    current_metric_name <- names(lgb_cv_run$best_score)[1] # 获取实际用于best_score的指标名 (通常只有一个元素)
+    
+    cat("  CV完成。最佳轮数: ", current_best_iteration, 
+        ", 对应Test Metric ('", current_metric_name ,"'): ", sprintf("%.5f", current_best_metric), "\n")
+    
+    # 确保 current_best_metric 是单一数值，以防万一
+    if (!is.numeric(current_best_metric) || length(current_best_metric) != 1 || is.na(current_best_metric)) {
+      cat("警告: lgb_cv_run$best_score 返回的不是有效的单一数值。尝试从record_evals提取...\n")
+      first_metric_name_in_params <- lgb_cv_params_list$metric[1] # 取我们指定的第一个metric
+      if (first_metric_name_in_params %in% names(lgb_cv_run$record_evals$valid) &&
+          length(lgb_cv_run$record_evals$valid[[first_metric_name_in_params]]$eval) >= current_best_iteration) {
+        current_best_metric <- lgb_cv_run$record_evals$valid[[first_metric_name_in_params]]$eval[current_best_iteration]
+        current_metric_name <- first_metric_name_in_params # 更新metric name
+        cat("  备用提取: 从record_evals获取'", current_metric_name, "': ", sprintf("%.5f", current_best_metric), "\n")
+      } else {
+        cat("错误: 无法从record_evals中提取指标'", first_metric_name_in_params, "'. 跳过此参数组合的更新。\n")
+        current_best_metric <- Inf # 使其不会被选为最优
+      }
+    }
+    
+    all_cv_results_lgb[[i]] <- list(params = current_params_row, 
+                                    best_iteration = current_best_iteration,
+                                    best_metric_value = current_best_metric, 
+                                    metric_name = current_metric_name, 
+                                    full_log_list = lgb_cv_run$record_evals)
+    
+    if (is.numeric(current_best_metric) && current_best_metric < best_cv_metric_value_lgb) { # 假设指标都是越小越好
+      best_cv_metric_value_lgb <- current_best_metric
+      best_params_from_cv_lgb <- current_params_row
+      best_nrounds_from_cv_lgb <- current_best_iteration
+      best_metric_name_from_cv <- current_metric_name
+      cat("  >> 新的最优参数组合 found! Test Metric ('", best_metric_name_from_cv ,"'): ", sprintf("%.5f", best_cv_metric_value_lgb), "\n")
+    }
+  } else { 
+    cat("  参数组合 ", i, ": CV失败或未找到有效最佳轮数 (best_iter=", ifelse(!is.null(lgb_cv_run$best_iter), lgb_cv_run$best_iter, "NULL"), ").\n")
+    all_cv_results_lgb[[i]] <- list(params=current_params_row, error_msg="CV Failed or no valid best_iter")
+  }
+  rm(lgb_cv_run); gc(); # 在每次CV迭代后尝试回收内存
+}
+
+# 保存所有CV结果的摘要
+cv_summary_df_lgb <- do.call(rbind, lapply(all_cv_results_lgb, function(res) {
+  # 准备参数部分 (params_df)
+  params_list_for_df <- list()
+  if (!is.null(res$params) && (is.data.frame(res$params) || is.list(res$params))) {
+    current_params_values <- as.list(res$params) # expand.grid返回的是data.frame
+    # 确保每个参数值都是单一元素，以防万一
+    for (p_name in names(current_params_values)) {
+      params_list_for_df[[p_name]] <- if(length(current_params_values[[p_name]]) == 1) current_params_values[[p_name]] else paste(current_params_values[[p_name]], collapse="|")
+    }
+  } else {
+    # 如果 res$params 本身有问题或不存在
+    params_list_for_df <- list(param_group_issue = "Params not found or invalid format")
+  }
+  
+  # 准备指标和错误信息部分
+  if("error_msg" %in% names(res) && !is.null(res$error_msg) && !is.na(res$error_msg)) {
+    # CV运行出错
+    data.frame(
+      as.data.frame(params_list_for_df, stringsAsFactors = FALSE), # 将列表转为单行数据框
+      best_iteration = NA_integer_,
+      best_metric_value = NA_real_,
+      metric_name = NA_character_,
+      error = as.character(res$error_msg),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    # CV运行成功或部分成功，但某些值可能是NULL
+    best_iter_val <- if (is.null(res$best_iteration) || length(res$best_iteration) == 0) NA_integer_ else as.integer(res$best_iteration[1])
+    best_metric_val <- if (is.null(res$best_metric_value) || length(res$best_metric_value) == 0) NA_real_ else as.numeric(res$best_metric_value[1])
+    metric_name_val <- if (is.null(res$metric_name) || length(res$metric_name) == 0 || all(is.na(res$metric_name))) NA_character_ else as.character(res$metric_name[1])
+    
+    # 再次检查长度，以防万一
+    if(length(best_iter_val) != 1) best_iter_val <- NA_integer_
+    if(length(best_metric_val) != 1) best_metric_val <- NA_real_
+    if(length(metric_name_val) != 1) metric_name_val <- NA_character_
+    
+    data.frame(
+      as.data.frame(params_list_for_df, stringsAsFactors = FALSE), # 将列表转为单行数据框
+      best_iteration = best_iter_val,
+      best_metric_value = best_metric_val,
+      metric_name = metric_name_val,
+      error = NA_character_,
+      stringsAsFactors = FALSE
+    )
+  }
+}))
+
+cat("\n--- 调试: 结构 cv_summary_df_lgb (保存前) ---\n")
+print(str(cv_summary_df_lgb, vec.len = 2, list.len = 3))
+if(nrow(cv_summary_df_lgb) > 0) {
+  cat("前几行 cv_summary_df_lgb:\n")
+  print(head(cv_summary_df_lgb))
+}
+cat("--- 调试结束 ---\n")
+
+write.csv(cv_summary_df_lgb, param_search_results_file_lgb, row.names = FALSE)
+cat("\n所有LightGBM CV参数搜索结果已保存到: '", param_search_results_file_lgb, "'\n")
+
+if (is.null(best_params_from_cv_lgb) || is.null(best_nrounds_from_cv_lgb)) {
+  stop("未能通过网格搜索找到有效的最优参数组合。请检查CV过程和 '", param_search_results_file_lgb, "' 文件。")
+}
+
+cat("\n--- 网格搜索完成 --- \n")
+cat("最佳LightGBM超参数组合 (基于CV '", best_metric_name_from_cv, "'):\n"); print(best_params_from_cv_lgb)
+cat("对应的最佳轮数 (nrounds): ", best_nrounds_from_cv_lgb, "\n")
+cat("对应的最小Test Metric ('", best_metric_name_from_cv, "') (CV): ", sprintf("%.5f", best_cv_metric_value_lgb), "\n")
+
+# 绘制最优参数组合下的CV曲线
+best_cv_log_records_for_plot <- NULL
+if (!is.null(best_params_from_cv_lgb)) {
+  for(res in all_cv_results_lgb){
+    if(!is.null(res$params) && !("error_msg" %in% names(res)) && identical(as.list(res$params), as.list(best_params_from_cv_lgb))){
+      best_cv_log_records_for_plot <- res$full_log_list; break
+    }
+  }
+}
+if(!is.null(best_cv_log_records_for_plot) && !is.null(best_cv_log_records_for_plot$valid) && length(best_cv_log_records_for_plot$valid) > 0){
+  cv_plot_list <- list()
+  # metrics_in_log_plot <- names(best_cv_log_records_for_plot$valid) # 获取所有验证集上记录的指标
+  # 如果只想画 lgb_cv_params_list$metric 中指定的第一个：
+  metrics_in_log_plot <- lgb_cv_params_list$metric[1] # 使用CV时主要的metric
+  
+  for(m_name in metrics_in_log_plot){
+    if(!is.null(best_cv_log_records_for_plot$train[[m_name]]$eval) && length(best_cv_log_records_for_plot$train[[m_name]]$eval) > 0) {
+      cv_plot_list[[paste0("train_",m_name)]] <- data.frame(iter=seq_along(best_cv_log_records_for_plot$train[[m_name]]$eval), value=as.numeric(best_cv_log_records_for_plot$train[[m_name]]$eval), metric_type=paste0("train_",m_name), stringsAsFactors=FALSE)
+    }
+    if(!is.null(best_cv_log_records_for_plot$valid[[m_name]]$eval) && length(best_cv_log_records_for_plot$valid[[m_name]]$eval) > 0) {
+      cv_plot_list[[paste0("valid_",m_name)]] <- data.frame(iter=seq_along(best_cv_log_records_for_plot$valid[[m_name]]$eval), value=as.numeric(best_cv_log_records_for_plot$valid[[m_name]]$eval), metric_type=paste0("valid_",m_name), stringsAsFactors=FALSE)
+    }
+  }
+  if(length(cv_plot_list) > 0){
+    plot_df_cv <- do.call(rbind, cv_plot_list)
+    png(cv_metrics_plot_file_lgb, width=1000, height=600)
+    p_cv <- ggplot(plot_df_cv, aes(x=iter, y=value, color=metric_type)) + geom_line(linewidth=1) +
+      geom_vline(xintercept=best_nrounds_from_cv_lgb, linetype="dashed", color="red", linewidth=0.8) +
+      annotate("text", x=best_nrounds_from_cv_lgb, y=min(plot_df_cv$value, na.rm=T), label=paste("Best iter:", best_nrounds_from_cv_lgb), hjust=-0.1, vjust=-0.5, color="red") +
+      labs(title=paste("LightGBM CV Metrics (Best Params)\nOptimal nrounds =",best_nrounds_from_cv_lgb,"for",best_metric_name_from_cv), x="Iteration", y="Metric Value") + 
+      theme_minimal(base_size=12) + theme(legend.position="top", plot.title = element_text(hjust = 0.5))
+    print(p_cv); dev.off(); cat("最优CV曲线图已保存: '", cv_metrics_plot_file_lgb, "'\n")
+  } else { cat("警告: 未能为最优CV结果生成绘图数据 (cv_plot_list为空)。\n") }
+} else { cat("警告: 未能找到最优CV日志用于绘图。\n") }
+rm(all_cv_results_lgb, cv_summary_df_lgb, best_cv_log_records_for_plot, cv_plot_list, plot_df_cv, lgb_cv_params_list); gc()
+
+
+
+
+# --- 6. 训练最终LightGBM模型 (使用最优参数) ---
+cat("\n步骤5: 训练最终LightGBM模型 (使用最优参数和nrounds)...\n")
+final_lgb_params_list <- c(
+  list(objective="multiclass", metric=c("multi_logloss","multi_error"), num_class=num_classes, verbosity=-1, num_threads=0), 
+  as.list(best_params_from_cv_lgb) # 将数据框行转为列表
+)
+set.seed(123)
+valids_lgb_final <- list(eval = dvalidation_lgb, train = dtrain_lgb) # valids用于监控
+
+final_lgb_model <- NULL
+# eval_history_callback <- lgb.cb.record.evaluation() # 【移除这一行】
+
+tryCatch({
+  final_lgb_model <- lgb.train(
+    params = final_lgb_params_list,
+    data = dtrain_lgb, 
+    nrounds = best_nrounds_from_cv_lgb,
+    valids = valids_lgb_final, 
+    eval_freq = 1,          # 确保每一轮都记录指标
+    record = TRUE,          # 明确要求记录 (虽然通常是默认)
+    # callbacks = list(eval_history_callback), # 【移除这一行】
+    verbose = 1             # 仍然可以打印一些信息
+  )
+}, error = function(e) { 
+  cat("错误: 训练最终LightGBM失败: ", conditionMessage(e), "\n"); final_lgb_model <<- NULL 
+})
+if(is.null(final_lgb_model)) stop("最终LightGBM模型训练失败。")
+cat("最终LightGBM模型训练完成。\n")
+
+# 绘制最终模型训练过程中的指标曲线 (从 final_lgb_model$record_evals 提取)
+cat("\n步骤5.1: 绘制最终模型训练曲线 (从模型对象的record_evals中提取)...\n")
+if (!is.null(final_lgb_model$record_evals) && length(final_lgb_model$record_evals) > 0) {
+  eval_results_list_final_train <- final_lgb_model$record_evals
+  
+  cat("--- 调试: 结构 final_lgb_model$record_evals (用于最终模型训练曲线) ---\n")
+  print(str(eval_results_list_final_train, max.level = 4)) # 打印更深层结构
+  cat("--- 调试结束 ---\n")
+  
+  plot_data_list_final_train <- list()
+  
+  # 遍历记录中的数据集名称 (如 "train", "eval")
+  for(data_name in names(eval_results_list_final_train)){
+    if (tolower(data_name) == "start_iter") next # 跳过start_iter (不区分大小写)
+    
+    if (!is.null(eval_results_list_final_train[[data_name]]) && is.list(eval_results_list_final_train[[data_name]])) {
+      cat("Processing data_set for final train plot: '", data_name, "'\n")
+      
+      # 遍历该数据集中记录的指标名称 (如 "multi_logloss", "multi_error")
+      for(metric_name in names(eval_results_list_final_train[[data_name]])){ 
+        
+        metric_data_container <- eval_results_list_final_train[[data_name]][[metric_name]]
+        metric_values_vector <- NULL 
+        
+        # 【关键修正，与CV的record_evals结构一致】
+        # 结构是 $dataset$metric$eval (其中 $eval 是一个包含数值的列表)
+        if (is.list(metric_data_container) && "eval" %in% names(metric_data_container) &&
+            is.list(metric_data_container$eval) && length(metric_data_container$eval) > 0) {
+          
+          temp_values <- tryCatch(as.numeric(unlist(metric_data_container$eval)), error = function(e) NULL)
+          if (!is.null(temp_values) && is.numeric(temp_values)) {
+            metric_values_vector <- temp_values
+          } else {
+            cat("    未能将 metric_data_container$eval unlist并转换为数值向量 for final train plot.\n")
+          }
+        } else if (is.numeric(metric_data_container) && length(metric_data_container) > 0) { # 有时可能直接是向量
+          metric_values_vector <- metric_data_container
+          cat("    Metric '", metric_name, "' in '", data_name, "' for final train plot was directly a numeric vector.\n")
+        } else {
+          cat("    metric_data_container for '", metric_name, "' in '", data_name, "' (final train plot) 不符合预期结构.\n")
+          cat("    Structure of metric_data_container:\n")
+          print(str(metric_data_container, max.level=2))
+        }
+        
+        if (!is.null(metric_values_vector) && is.numeric(metric_values_vector) && length(metric_values_vector) > 0) {
+          num_iters <- length(metric_values_vector)
+          plot_data_list_final_train[[paste0(data_name, "_", metric_name)]] <- data.frame(
+            iter = 1:num_iters, 
+            value = metric_values_vector,
+            metric_type = factor(paste0(data_name, "_", metric_name)),
+            stringsAsFactors = FALSE
+          )
+          cat("    Added to plot_data_list_final_train (final train plot): ", paste0(data_name, "_", metric_name), "\n")
+        } else {
+          cat("    Skipped metric_name='", metric_name, "' for data_name='", data_name, "' (final train plot - not numeric, NULL, or zero length after extraction).\n")
+        }
+      }
+    } else {
+      cat("Skipped data_set for final train plot: '", data_name, "' (NULL or not a list).\n")
+    }
+  }
+  
+  if (length(plot_data_list_final_train) > 0) {
+    training_history_final_lgb_df_melt <- do.call(rbind, plot_data_list_final_train)
+    # ... (后续的ggplot代码与之前相同，用于绘制 training_history_final_lgb_df_melt) ...
+    # (包括将merror转为accuracy的逻辑)
+    if(!is.null(training_history_final_lgb_df_melt) && nrow(training_history_final_lgb_df_melt) > 0 &&
+       "value" %in% names(training_history_final_lgb_df_melt) && is.numeric(training_history_final_lgb_df_melt$value)) {
+      
+      plot_df_train_final_for_plot <- training_history_final_lgb_df_melt %>%
+        mutate(value_to_plot = ifelse(grepl("merror", metric_type), 1 - value, value),
+               metric_group = ifelse(grepl("logloss", metric_type), "LogLoss", "Accuracy"))
+      
+      
+      png(train_metrics_plot_file_lgb, width = 1200, height = 700)
+      p_train_hist_final_lgb <- ggplot(plot_df_train_final_for_plot, aes(x = iter, y = value_to_plot, color = metric_type)) +
+        geom_line(linewidth = 1) +
+        labs(title = "Final LightGBM Model Training History (from $record_evals)", 
+             x = "Number of Rounds (Iteration)", y = "Metric Value") +
+        theme_minimal(base_size = 14) + 
+        theme(legend.position = "top", plot.title = element_text(hjust = 0.5)) +
+        facet_wrap(~metric_group, scales = "free_y", labeller = as_labeller(c(`LogLoss`="LogLoss Scale", `Accuracy`="Accuracy Scale")))
+      print(p_train_hist_final_lgb)
+      dev.off()
+      cat("最终模型训练历史指标曲线图已保存到: '", train_metrics_plot_file_lgb, "'\n")
+    } else {
+      cat("警告: 未能从 final_lgb_model$record_evals 为最终模型训练过程生成有效的绘图数据。\n")
+    }
+  } else {
+    cat("警告: 从 final_lgb_model$record_evals 提取的 plot_data_list_final_train 为空 (final model training plot)。\n")
+  }
+} else {
+  cat("警告: 未能获取LightGBM最终模型训练历史 (final_lgb_model$record_evals 为 NULL 或为空) (final model training plot)。\n")
+}
+if(exists("plot_data_list_final_train")) rm(plot_data_list_final_train)
+if(exists("training_history_final_lgb_df_melt")) rm(training_history_final_lgb_df_melt)
+if(exists("plot_df_train_final_for_plot")) rm(plot_df_train_final_for_plot)
+gc()
+
+
+
+# --- 7. 在测试集上评估模型性能 (LightGBM) ---
+cat("\n步骤6: 在测试集上评估最终LightGBM模型 (更全面)...\n")
+
+# 【修改这里的条件】检查 test_features_matrix 和 test_labels_numeric
+if (exists("test_features_matrix") && nrow(test_features_matrix) > 0 && ncol(test_features_matrix) > 0 &&
+    exists("test_labels_numeric") && length(test_labels_numeric) == nrow(test_features_matrix)) {
+  
+  # predict 函数直接使用 test_features_matrix
+  pred_probs_lgb_test <- predict(final_lgb_model, test_features_matrix) 
+  
+  # 检查 pred_probs_lgb_test 的维度
+  if (is.null(dim(pred_probs_lgb_test)) || nrow(pred_probs_lgb_test) != nrow(test_features_matrix) || ncol(pred_probs_lgb_test) != num_classes) {
+    cat("警告: predict() 返回的概率矩阵维度不正确。维度: ", paste(dim(pred_probs_lgb_test), collapse="x"), 
+        ". 预期行数: ", nrow(test_features_matrix), ", 预期列数: ", num_classes, "\n")
+    # 尝试手动重塑 (如果返回的是长向量)
+    if (length(pred_probs_lgb_test) == nrow(test_features_matrix) * num_classes) {
+      pred_probs_lgb_test <- matrix(pred_probs_lgb_test, nrow = nrow(test_features_matrix), ncol = num_classes, byrow = TRUE)
+      cat("已将预测概率手动重塑为矩阵。\n")
+    } else {
+      stop("无法处理 predict() 返回的概率格式，也无法手动重塑。")
+    }
+  }
+  
+  pred_labels_numeric_lgb_test <- max.col(pred_probs_lgb_test) - 1
+  
+  pred_labels_factor_lgb_test <- numeric_map_to_original_factor[as.character(pred_labels_numeric_lgb_test)]
+  test_labels_factor_original <- numeric_map_to_original_factor[as.character(test_labels_numeric)]
+  pred_labels_factor_lgb_test <- factor(pred_labels_factor_lgb_test, levels = original_levels)
+  test_labels_factor_original <- factor(test_labels_factor_original, levels = original_levels)
+  
+  if(length(pred_labels_factor_lgb_test) == length(test_labels_factor_original) && length(pred_labels_factor_lgb_test) > 0) {
+    conf_matrix_test_lgb <- confusionMatrix(pred_labels_factor_lgb_test, test_labels_factor_original)
+    # ... (所有手动计算Precision/Recall/F1和写入文件的逻辑不变) ...
+    precision_by_class <- diag(conf_matrix_test_lgb$table) / colSums(conf_matrix_test_lgb$table); recall_by_class <- diag(conf_matrix_test_lgb$table) / rowSums(conf_matrix_test_lgb$table); f1_by_class <- 2 * (precision_by_class * recall_by_class) / (precision_by_class + recall_by_class); f1_by_class[is.na(f1_by_class)] <- 0; macro_precision <- mean(precision_by_class, na.rm = TRUE); macro_recall <- mean(recall_by_class, na.rm = TRUE); macro_f1 <- mean(f1_by_class, na.rm = TRUE); support_by_class <- rowSums(conf_matrix_test_lgb$table); weighted_precision <- weighted.mean(precision_by_class, w = support_by_class, na.rm = TRUE); weighted_recall <- weighted.mean(recall_by_class, w = support_by_class, na.rm = TRUE); weighted_f1 <- weighted.mean(f1_by_class, w = support_by_class, na.rm = TRUE);
+    sink(performance_metrics_file_lgb, append=TRUE); cat("\n\n--- Tuned LightGBM Model Performance on Test Set (Full Eval) ---\n\n"); if(exists("best_params_from_cv_lgb")) print(best_params_from_cv_lgb); if(exists("best_nrounds_from_cv_lgb")) cat("\nNrounds used (from CV): ", best_nrounds_from_cv_lgb, "\n"); if(exists("final_num_features")) cat("Features used: ", final_num_features, "\n"); cat("亚型类别: ", paste(original_levels, collapse=", "), "\n\n"); print(conf_matrix_test_lgb); cat("\n--- Manually Calculated Metrics ---\nPrecision by Class:\n"); print(precision_by_class); cat("Recall by Class:\n"); print(recall_by_class); cat("F1-Score by Class:\n"); print(f1_by_class); cat("\nMacro-Averaged Precision: ", sprintf("%.4f", macro_precision), "\nMacro-Averaged Recall:    ", sprintf("%.4f", macro_recall), "\nMacro-Averaged F1-Score:  ", sprintf("%.4f", macro_f1), "\n\nWeighted-Averaged Precision: ", sprintf("%.4f", weighted_precision), "\nWeighted-Averaged Recall:    ", sprintf("%.4f", weighted_recall), "\nWeighted-Averaged F1-Score:  ", sprintf("%.4f", weighted_f1), "\n\n--- Caret Overall Statistics ---\nAccuracy: ", sprintf("%.4f", conf_matrix_test_lgb$overall['Accuracy']), "\nKappa:    ", sprintf("%.4f", conf_matrix_test_lgb$overall['Kappa']), "\n"); sink()
+    cat("Tuned LightGBM测试集评估结果已追加保存到: '", performance_metrics_file_lgb, "'\n")
+  } else { cat("警告: Tuned LightGBM测试集预测或标签数据不一致或为空。\n") }
+} else {
+  cat("测试集特征矩阵为空、无特征或标签不匹配，跳过Tuned LightGBM最终模型评估。\n")
+}
+if(exists("pred_probs_lgb_test")) rm(pred_probs_lgb_test, pred_labels_numeric_lgb_test, pred_labels_factor_lgb_test, test_labels_factor_original, conf_matrix_test_lgb); gc()
+
+
+# --- 8. LightGBM特征重要性 ---
+cat("\n步骤7: 提取、排序并可视化最终LightGBM模型的特征重要性...\n")
+# original_feature_names_for_lgb_imp 已在步骤3保存
+
+# 【修改】在这里移除大型矩阵和lgb.Dataset对象，因为后续不再需要它们的数据内容了
+if(exists("train_features_matrix")) rm(train_features_matrix); 
+if(exists("validation_features_matrix")) rm(validation_features_matrix); 
+if(exists("test_features_matrix")) rm(test_features_matrix);
+if(exists("dtrain_lgb")) rm(dtrain_lgb); 
+if(exists("dvalidation_lgb")) rm(dvalidation_lgb); 
+if(exists("dtest_lgb")) rm(dtest_lgb); 
+gc()
+cat("大型矩阵和lgb.Dataset对象已移除。\n")
+
+tryCatch({
+  importance_matrix_lgb <- lgb.importance(model = final_lgb_model)
+  if (!is.null(importance_matrix_lgb) && nrow(importance_matrix_lgb) > 0) {
+    # 检查返回的 Feature 列是否是序号 (例如, "Column_0", "Column_1")
+    # LightGBM有时会返回 "Feature_0", "Feature_1"... 如果它没有从数据中捕获到原始名称
+    if (all(grepl("^(Column_[0-9]+|Feature_[0-9]+)$", importance_matrix_lgb$Feature))) {
+      cat("LightGBM重要性返回的是通用列名/序号，将尝试映射回原始特征名...\n")
+      col_indices_from_lgb <- as.integer(gsub("^(Column_|Feature_)", "", importance_matrix_lgb$Feature))
+      if (all(!is.na(col_indices_from_lgb)) && 
+          !is.null(original_feature_names_for_lgb_imp) && 
+          max(col_indices_from_lgb, na.rm = TRUE) < length(original_feature_names_for_lgb_imp)) {
+        importance_matrix_lgb$Feature <- original_feature_names_for_lgb_imp[col_indices_from_lgb + 1]
+      } else {
+        cat("警告: 无法将LightGBM的列序号安全映射回原始特征名。\n")
+      }
+    } else {
+      cat("LightGBM重要性似乎已包含实际特征名。\n")
+    }
+    cat("Tuned LightGBM特征重要性 (Top 20):\n"); print(head(importance_matrix_lgb, 20))
+    png(importance_plot_file_lgb, width = 1000, height = 700)
+    lgb.plot.importance(importance_matrix_lgb, top_n = min(20, nrow(importance_matrix_lgb)))
+    dev.off()
+    cat("Tuned LightGBM特征重要性图已保存到: '", importance_plot_file_lgb, "'\n")
+  } else { cat("警告: 未能从Tuned LightGBM模型中提取特征重要性。\n") }
+}, error = function(e) { cat("错误: 提取Tuned LightGBM特征重要性时失败: ", conditionMessage(e), "\n") })
+if(exists("importance_matrix_lgb")) rm(importance_matrix_lgb)
+if(exists("original_feature_names_for_lgb_imp")) rm(original_feature_names_for_lgb_imp); gc()
+
+
+# --- 9. 保存训练好的LightGBM模型 ---
+cat("\n步骤8: 保存训练好的最终LightGBM模型...\n")
+lgb.save(final_lgb_model, filename = lgb_model_output_file)
+cat("最终LightGBM模型已保存到: '", lgb_model_output_file, "'\n")
+if(exists("final_lgb_model")) rm(final_lgb_model); gc()
+
+cat("\n--- 模型训练与评估 (使用LightGBM手动调优, 增强评估, 内存管理) 完成！ ---\n")
+# if(exists("log_file_lgb") && file.exists(log_file_lgb)) sink() # 关闭日志

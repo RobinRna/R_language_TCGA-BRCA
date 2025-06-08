@@ -1,0 +1,66 @@
+
+
+--- Tuned XGBoost Model Performance on Test Set (Direct Usage, Full Eval) ---
+
+Best Hyperparameters from CV:
+     eta max_depth subsample colsample_bytree min_child_weight gamma
+65 0.075         3       0.6              0.7                1     0
+
+Nrounds used (from CV):  78 
+Features used in model:  24776 
+亚型类别 (原始):  Basal-like, HER2-enriched, Luminal A, Luminal B 
+
+Confusion Matrix and Statistics
+
+               Reference
+Prediction      Basal-like HER2-enriched Luminal A Luminal B
+  Basal-like            17             1         2         3
+  HER2-enriched          0             6         0         0
+  Luminal A              2             1        31        10
+  Luminal B              0             4        12        13
+
+Overall Statistics
+                                          
+               Accuracy : 0.6569          
+                 95% CI : (0.5563, 0.7481)
+    No Information Rate : 0.4412          
+    P-Value [Acc > NIR] : 9.313e-06       
+                                          
+                  Kappa : 0.5015          
+                                          
+ Mcnemar's Test P-Value : 0.1636          
+
+Statistics by Class:
+
+                     Class: Basal-like Class: HER2-enriched Class: Luminal A Class: Luminal B
+Sensitivity                     0.8947              0.50000           0.6889           0.5000
+Specificity                     0.9277              1.00000           0.7719           0.7895
+Pos Pred Value                  0.7391              1.00000           0.7045           0.4483
+Neg Pred Value                  0.9747              0.93750           0.7586           0.8219
+Prevalence                      0.1863              0.11765           0.4412           0.2549
+Detection Rate                  0.1667              0.05882           0.3039           0.1275
+Detection Prevalence            0.2255              0.05882           0.4314           0.2843
+Balanced Accuracy               0.9112              0.75000           0.7304           0.6447
+
+--- Manually Calculated Metrics ---
+Precision by Class:
+   Basal-like HER2-enriched     Luminal A     Luminal B 
+    0.8947368     0.5000000     0.6888889     0.5000000 
+Recall by Class:
+   Basal-like HER2-enriched     Luminal A     Luminal B 
+    0.7391304     1.0000000     0.7045455     0.4482759 
+F1-Score by Class:
+   Basal-like HER2-enriched     Luminal A     Luminal B 
+    0.8095238     0.6666667     0.6966292     0.4727273 
+
+Macro-Averaged Precision:  0.6459 
+Macro-Averaged Recall:     0.7230 
+Macro-Averaged F1-Score:   0.6614 
+
+Weighted-Averaged Precision:  0.6705 
+Weighted-Averaged Recall:     0.6569 
+Weighted-Averaged F1-Score:   0.6567 
+
+--- Caret Overall Statistics ---
+Accuracy:  0.6569 
+Kappa:     0.5015 
